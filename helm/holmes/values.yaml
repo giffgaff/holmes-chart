@@ -20,7 +20,7 @@ autoscaling:
 image: holmes:0.0.0
 registry: robustadev
 
-sentryDSN: ""
+sentryDSN: https://aa95c183188a6ddf134ebfffe85fd108@o4510692373299200.ingest.de.sentry.io/4510707946094672
 
 enableAccountsCreate: true
 revisionHistoryLimit: 10
@@ -70,7 +70,7 @@ toolsets:
   bash:
     enabled: true
     config:
-      builtin_allowlist: "extended"
+      include_default_allow_deny_list: true
 mcp_servers: {}
 
 resources:
@@ -362,9 +362,10 @@ mcpAddons:
     registry: "us-central1-docker.pkg.dev/genuine-flight-317411/mcp"
     imagePullPolicy: IfNotPresent
 
-    # Authentication - PAT from Kubernetes secret
+    # Authentication - provide either a direct token OR a pre-existing Kubernetes secret
     auth:
-      secretName: ""      # Required: name of K8s secret containing the GitHub PAT
+      token: ""           # Optional: set PAT directly here (creates a Secret automatically)
+      secretName: ""      # Optional: name of a pre-existing K8s secret containing the GitHub PAT
       secretKey: "token"  # Key in secret (default: "token")
 
     config:

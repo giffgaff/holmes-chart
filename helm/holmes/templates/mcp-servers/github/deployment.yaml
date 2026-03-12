@@ -1,5 +1,22 @@
 {{- if .Values.mcpAddons.github.enabled }}
 ---
+{{- if .Values.mcpAddons.github.auth.token }}
+apiVersion: v1
+kind: Secret
+metadata:
+  name: {{ .Release.Name }}-github-mcp-token
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app: {{ .Release.Name }}-github-mcp
+    app.kubernetes.io/name: github-mcp-server
+    app.kubernetes.io/instance: {{ .Release.Name }}
+    app.kubernetes.io/component: mcp-server
+    app.kubernetes.io/part-of: holmes
+type: Opaque
+stringData:
+  token: {{ .Values.mcpAddons.github.auth.token | quote }}
+---
+{{- end }}
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -77,8 +94,13 @@ spec:
         - name: GITHUB_PERSONAL_ACCESS_TOKEN
           valueFrom:
             secretKeyRef:
-              name: {{ required "mcpAddons.github.auth.secretName is required" .Values.mcpAddons.github.auth.secretName }}
+              {{- if .Values.mcpAddons.github.auth.token }}
+              name: {{ .Release.Name }}-github-mcp-token
+              key: token
+              {{- else }}
+              name: {{ required "Either mcpAddons.github.auth.token or mcpAddons.github.auth.secretName must be set" .Values.mcpAddons.github.auth.secretName }}
               key: {{ .Values.mcpAddons.github.auth.secretKey | default "token" }}
+              {{- end }}
         {{- if .Values.mcpAddons.github.config.toolsets }}
         - name: GITHUB_TOOLSETS
           valueFrom:
