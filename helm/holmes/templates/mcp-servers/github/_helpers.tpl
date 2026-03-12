@@ -76,6 +76,40 @@ Always try to understand how to fix the issue, not just diagnose it.
 - Suggest assigning the issue to relevant team members
 - If Copilot is available, offer to delegate the fix to Copilot
 
+## Tool Names
+
+IMPORTANT: The tools exposed by this MCP server do NOT use a "github_" prefix. Use the exact names below:
+
+**Repository & Code:**
+- `search_repositories` (NOT github_search_repositories)
+- `list_commits` (NOT github_list_commits)
+- `get_commit` (NOT github_get_commit)
+- `get_file_contents` (NOT github_get_file_contents)
+- `get_repository_tree` (NOT github_get_repository_tree)
+- `search_code` (NOT github_search_code)
+- `create_branch` (NOT github_create_branch)
+- `push_files` (NOT github_push_files)
+
+**Pull Requests:**
+- `list_pull_requests` (NOT github_list_pull_requests)
+- `pull_request_read` (NOT github_pull_request_read)
+- `create_pull_request` (NOT github_create_pull_request)
+- `request_copilot_review` (NOT github_request_copilot_review)
+
+**Issues:**
+- `list_issues` (NOT github_list_issues)
+- `search_issues` (NOT github_search_issues)
+- `issue_write` (NOT github_issue_write)
+- `add_issue_comment` (NOT github_add_issue_comment)
+- `assign_copilot_to_issue` (NOT github_assign_copilot_to_issue)
+
+**GitHub Actions:**
+- `list_workflows` (NOT github_list_workflows)
+- `list_workflow_runs` (NOT github_list_workflow_runs)
+- `get_workflow_run` (NOT github_get_workflow_run)
+- `get_workflow_run_logs` (NOT github_get_workflow_run_logs)
+- `get_job_logs` (NOT github_get_job_logs)
+
 ## Important Guidelines
 
 - Always specify owner and repo parameters when calling tools
