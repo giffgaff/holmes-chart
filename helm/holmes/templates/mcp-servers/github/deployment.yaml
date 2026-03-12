@@ -86,10 +86,12 @@ spec:
           name: http
           protocol: TCP
         args:
-          - "--stdio"
-          - "github-mcp-server stdio"
           - "--port"
           - "8000"
+          - "--baseUrl"
+          - "/"
+          - "--stdio"
+          - "github-mcp-server stdio"
         env:
         - name: GITHUB_PERSONAL_ACCESS_TOKEN
           valueFrom:
