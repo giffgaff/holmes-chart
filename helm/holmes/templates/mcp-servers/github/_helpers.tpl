@@ -116,5 +116,14 @@ IMPORTANT: The tools exposed by this MCP server do NOT use a "github_" prefix. U
 - Fetch logs for failed workflow jobs - they contain the actual error messages
 - Use code search to find relevant files before reading them
 - Check PR diffs to understand what changed
+
+## Avoiding Excessive Data
+
+IMPORTANT: Always limit the amount of data returned to avoid context overflow:
+- When calling `list_workflow_runs`, ALWAYS pass a `perPage` limit. Use `perPage: 1` when asked for the latest single run, `perPage: 5` when asked for the last few runs. Never call it without a perPage limit.
+- When calling `list_commits`, ALWAYS pass `perPage: 5` or less unless more are explicitly needed.
+- When calling `list_pull_requests` or `list_issues`, ALWAYS pass `perPage: 5` or less unless more are explicitly needed.
+- To get details on a specific run: use the run ID returned by `list_workflow_runs` with `get_workflow_run`.
+- To get logs: use `get_job_logs` for a specific job rather than `get_workflow_run_logs` for the entire run, which can be very large.
 {{- end -}}
 {{- end -}}
