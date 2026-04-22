@@ -159,6 +159,14 @@ def test_ask_holmes(
         int(scores.get("correctness", 0)) == 1
     ), f"Test {test_case.id} failed (score: {scores.get('correctness', 0)})\nActual: {output}\nExpected: {expected_output}"
 
+    # Check token limit if configured
+    if test_case.max_tokens is not None:
+        actual_tokens = result.total_tokens
+        assert actual_tokens <= test_case.max_tokens, (
+            f"Test {test_case.id} exceeded token limit: "
+            f"used {actual_tokens} tokens, max allowed is {test_case.max_tokens}"
+        )
+
 
 # TODO: can this call real ask_holmes so more of the logic is captured
 def ask_holmes(
@@ -190,7 +198,7 @@ def ask_holmes(
     with tool_result_storage() as tool_results_dir:
         ai = ToolCallingLLM(
             tool_executor=tool_executor,
-            max_steps=40,
+            max_steps=100,
             llm=create_eval_llm(model=model, tracer=tracer),
             tool_results_dir=tool_results_dir,
         )
@@ -250,7 +258,7 @@ def ask_holmes(
         # Create LLM completion trace within current context
         with tracer.start_trace("Holmes Run", span_type=SpanType.TASK) as llm_span:
             start_time = time.time()
-            result = ai.messages_call(messages=messages, trace_span=llm_span)
+            result = ai.call(messages=messages, trace_span=llm_span)
             holmes_duration = time.time() - start_time
             # Log duration directly to eval_span
             eval_span.log(metadata={"holmes_duration": holmes_duration})

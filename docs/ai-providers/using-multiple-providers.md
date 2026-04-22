@@ -108,7 +108,7 @@ Define multiple model configurations and switch between them by name. This is us
         model: openai/gpt-4.1
         temperature: 0
 
-      # Azure OpenAI Models
+      # Azure AI Foundry Models
       azure-41:
         api_key: "{{ env.AZURE_API_KEY }}"
         model: azure/gpt-4.1
@@ -215,7 +215,7 @@ Define multiple model configurations and switch between them by name. This is us
           model: openai/gpt-4.1
           temperature: 0
 
-        # Azure OpenAI Models
+        # Azure AI Foundry Models
         azure-41:
           api_key: "{{ env.AZURE_API_KEY }}"
           model: azure/gpt-4.1
@@ -301,7 +301,7 @@ Clients can specify the model in their API requests:
 ```
 
 ### Robusta AI Integration
-If you're a Robusta SaaS customer, you can also use [Robusta AI](robusta-ai.md) which provides access to multiple models without managing individual API keys.
+If you're a Robusta customer, you can also use [Robusta AI](robusta-ai.md) which provides access to multiple models without managing individual API keys.
 
 ## See Also
 

@@ -1,8 +1,11 @@
 import logging
 import os
 import os.path
+import threading
 from enum import Enum
 from pathlib import Path
+
+display_logger = logging.getLogger("holmes.display.config")
 from typing import TYPE_CHECKING, Any, List, Optional, Union
 
 import sentry_sdk
@@ -16,10 +19,12 @@ from pydantic import (
 )
 
 from holmes.common.env_vars import ROBUSTA_CONFIG_PATH
+from holmes.core.init_event import EventCallback, StatusEvent, StatusEventKind
 from holmes.core.llm import DefaultLLM, LLMModelRegistry
-from holmes.core.tools import Toolset
+from holmes.core.tools import PrerequisiteCacheMode, Toolset, ToolsetTag
 from holmes.core.tools_utils.tool_executor import ToolExecutor
 from holmes.core.toolset_manager import ToolsetManager
+from holmes.core.transformers.llm_summarize import LLMSummarizeTransformer
 from holmes.plugins.runbooks import (
     RunbookCatalog,
     load_runbook_catalog,
@@ -50,13 +55,14 @@ class SupportedTicketSources(str, Enum):
 
 class Config(RobustaBaseConfig):
     model: Optional[str] = None
+    _model_source: Optional[str] = None  # tracks where the model was set from
     api_key: Optional[SecretStr] = (
         None  # if None, read from OPENAI_API_KEY or AZURE_OPENAI_ENDPOINT env var
     )
     api_base: Optional[str] = None
     api_version: Optional[str] = None
     fast_model: Optional[str] = None
-    max_steps: int = 40
+    max_steps: int = 100
     cluster_name: Optional[str] = None
 
     alertmanager_url: Optional[str] = None
@@ -99,12 +105,20 @@ class Config(RobustaBaseConfig):
     # if True, we will try to load the Robusta AI model, in cli we aren't trying to load it.
     should_try_robusta_ai: bool = False
 
+    # Ignored by Holmes - exists solely to allow YAML anchors/aliases in config files.
+    # Define reusable blocks here and reference them elsewhere with YAML aliases (*).
+    anchors: Optional[Any] = None
+
     toolsets: Optional[dict[str, dict[str, Any]]] = None
     mcp_servers: Optional[dict[str, dict[str, Any]]] = None
     additional_toolsets: Optional[List[Toolset]] = None
 
-    _server_tool_executor: Optional[ToolExecutor] = None
-    _agui_tool_executor: Optional[ToolExecutor] = None
+    # Thread-safe executor cache: stores (executor, cache_key) where cache_key
+    # is (tuple(tags), enable_all_toolsets_possible) so callers with different
+    # parameters don't silently receive a stale executor.
+    _cached_tool_executor: Optional[ToolExecutor] = None
+    _cached_executor_key: Optional[tuple] = None
+    _executor_lock: threading.Lock = PrivateAttr(default_factory=threading.Lock)
 
     # TODO: Separate those fields to facade class, this shouldn't be part of the config.
     _toolset_manager: Optional[ToolsetManager] = PrivateAttr(None)
@@ -113,14 +127,24 @@ class Config(RobustaBaseConfig):
     _config_file_path: Optional[Path] = PrivateAttr(None)
 
     @property
+    def cached_tool_executor(self) -> Optional[ToolExecutor]:
+        """Thread-safe read access to the cached executor."""
+        with self._executor_lock:
+            return self._cached_tool_executor
+
+    @property
     def toolset_manager(self) -> ToolsetManager:
         if not self._toolset_manager:
+            # Set the class-level default once before any transformers are
+            # instantiated.  ToolsetManager no longer needs to know about it.
+            if self.fast_model:
+                LLMSummarizeTransformer.set_default_fast_model(self.fast_model)
+
             self._toolset_manager = ToolsetManager(
                 toolsets=self.toolsets,
                 mcp_servers=self.mcp_servers,
                 custom_toolsets=self.custom_toolsets,
                 custom_toolsets_from_cli=self.custom_toolsets_from_cli,
-                global_fast_model=self.fast_model,
                 custom_runbook_catalogs=self.custom_runbook_catalogs,
                 config_file_path=self._config_file_path,
                 additional_toolsets=self.additional_toolsets,
@@ -143,11 +167,11 @@ class Config(RobustaBaseConfig):
 
     def log_useful_info(self):
         if self.llm_model_registry.models:
-            logging.info(
+            display_logger.info(
                 f"Loaded models: {list(self.llm_model_registry.models.keys())}"
             )
         else:
-            logging.warning("No llm models were loaded")
+            display_logger.warning("No llm models were loaded")
 
     @classmethod
     def load_from_file(cls, config_file: Optional[Path], **kwargs) -> "Config":
@@ -179,6 +203,19 @@ class Config(RobustaBaseConfig):
 
         if config_file is not None and config_file.exists():
             result._config_file_path = config_file
+
+        # Track where the model setting came from
+        if "model" in cli_options:
+            pass  # CLI --model flag: no source label needed (user just typed it)
+        elif config_from_file is not None and config_from_file.model is not None:
+            result._model_source = f"in {config_file}"
+        # Fall through to env var check below
+
+        if result.model is None:
+            model_from_env = os.environ.get("MODEL")
+            if model_from_env and model_from_env.strip():
+                result.model = model_from_env
+                result._model_source = "via $MODEL"
 
         result.log_useful_info()
         return result
@@ -214,6 +251,8 @@ class Config(RobustaBaseConfig):
         kwargs["cluster_name"] = Config.__get_cluster_name()
         kwargs["should_try_robusta_ai"] = True
         result = cls(**kwargs)
+        if "model" in kwargs:
+            result._model_source = "via $MODEL"
         result.log_useful_info()
         return result
 
@@ -242,126 +281,222 @@ class Config(RobustaBaseConfig):
         )
         return runbook_catalog
 
-    def create_console_tool_executor(
-        self, dal: Optional["SupabaseDal"], refresh_status: bool = False
+    # ── Unified factory methods ──
+
+    @staticmethod
+    def _executor_cache_key(
+        tags: List[ToolsetTag], enable_all: bool
+    ) -> tuple:
+        return (tuple(sorted(tags, key=lambda t: t.value)), enable_all)
+
+    def create_tool_executor(
+        self,
+        dal: Optional["SupabaseDal"] = None,
+        toolset_tag_filter: Optional[List[ToolsetTag]] = None,
+        enable_all_toolsets_possible: bool = True,
+        prerequisite_cache: PrerequisiteCacheMode = PrerequisiteCacheMode.ENABLED,
+        reuse_executor: bool = False,
+        on_event: EventCallback = None,
     ) -> ToolExecutor:
         """
-        Creates a ToolExecutor instance configured for CLI usage. This executor manages the available tools
-        and their execution in the command-line interface.
+        Create a ToolExecutor with explicit behavioral controls.
 
-        The method loads toolsets in this order, with later sources overriding earlier ones:
-        1. Built-in toolsets (tagged as CORE or CLI)
-        2. toolsets from config file will override and be merged into built-in toolsets with the same name.
-        3. Custom toolsets from config files which can not override built-in toolsets
+        Args:
+            dal: Optional database access layer.
+            toolset_tag_filter: Only include toolsets whose tags overlap with this
+                list (e.g. ``[ToolsetTag.CORE, ToolsetTag.CLI]``). Toolsets that
+                don't match any tag are excluded entirely — they won't be loaded,
+                checked, or returned. This filter is independent of
+                ``enable_all_toolsets_possible``: a toolset must pass the tag filter first, then
+                ``enable_all_toolsets_possible`` controls whether it gets enabled automatically.
+                Defaults to ``[ToolsetTag.CORE]`` if not specified.
+            enable_all_toolsets_possible: If True, automatically enable every toolset (that
+                passed the tag filter) that can work without explicit configuration.
+                If False, only toolsets explicitly enabled in config are loaded.
+            prerequisite_cache: Controls prerequisite check caching behavior.
+                DISABLED — run full checks eagerly, no disk caching.
+                ENABLED — use cached results when available (default).
+                FORCE_REFRESH — re-run all checks and update the cache.
+            reuse_executor: If True, cache the executor in memory and return the same
+                instance on subsequent calls with the *same* parameters.
+                A call with different ``toolset_tag_filter`` or
+                ``enable_all_toolsets_possible`` will create and cache a fresh executor.
+
+        Migration from removed helpers
+        ------------------------------
+        ``create_console_tool_executor(dal, refresh_status)``::
+
+            create_tool_executor(
+                dal=dal,
+                toolset_tag_filter=[ToolsetTag.CORE, ToolsetTag.CLI],
+                enable_all_toolsets_possible=True,
+                prerequisite_cache=PrerequisiteCacheMode.FORCE_REFRESH if refresh_status else PrerequisiteCacheMode.ENABLED,
+            )
+
+        ``create_agui_tool_executor(dal)``::
+
+            create_tool_executor(
+                dal=dal,
+                toolset_tag_filter=[ToolsetTag.CORE, ToolsetTag.CLI],
+                enable_all_toolsets_possible=True,
+                prerequisite_cache=PrerequisiteCacheMode.FORCE_REFRESH,
+                reuse_executor=True,
+            )
+
+        ``refresh_server_tool_executor(dal)``::
+
+            refresh_tool_executor(
+                dal=dal,
+                toolset_tag_filter=[ToolsetTag.CORE, ToolsetTag.CLUSTER],
+                enable_all_toolsets_possible=False,
+            )
         """
-        cli_toolsets = self.toolset_manager.list_console_toolsets(
-            dal=dal, refresh_status=refresh_status
+        tags = toolset_tag_filter or [ToolsetTag.CORE]
+        cache_key = self._executor_cache_key(tags, enable_all_toolsets_possible)
+
+        if reuse_executor:
+            with self._executor_lock:
+                if (
+                    self._cached_tool_executor is not None
+                    and self._cached_executor_key == cache_key
+                ):
+                    return self._cached_tool_executor
+                # Build inside the lock to prevent concurrent initialization
+                # for the same cache key
+                toolsets = self.toolset_manager.prepare_toolsets(
+                    dal=dal,
+                    toolset_tag_filter=tags,
+                    enable_all_toolsets_possible=enable_all_toolsets_possible,
+                    prerequisite_cache=prerequisite_cache,
+                    on_event=on_event,
+                )
+                executor = ToolExecutor(toolsets, on_event=on_event)
+                self._cached_tool_executor = executor
+                self._cached_executor_key = cache_key
+                return executor
+
+        toolsets = self.toolset_manager.prepare_toolsets(
+            dal=dal,
+            toolset_tag_filter=tags,
+            enable_all_toolsets_possible=enable_all_toolsets_possible,
+            prerequisite_cache=prerequisite_cache,
+            on_event=on_event,
         )
-        return ToolExecutor(cli_toolsets)
+        return ToolExecutor(toolsets, on_event=on_event)
 
-    def create_agui_tool_executor(self, dal: Optional["SupabaseDal"]) -> ToolExecutor:
-        """
-        Creates ToolExecutor for the AG-UI server endpoints
-        """
-
-        if self._agui_tool_executor:
-            return self._agui_tool_executor
-
-        # Use same toolset as CLI for AG-UI front-end.
-        agui_toolsets = self.toolset_manager.list_console_toolsets(
-            dal=dal, refresh_status=True
-        )
-
-        self._agui_tool_executor = ToolExecutor(agui_toolsets)
-
-        return self._agui_tool_executor
-
-    def create_tool_executor(self, dal: Optional["SupabaseDal"]) -> ToolExecutor:
-        """
-        Creates ToolExecutor for the server endpoints
-        """
-
-        if self._server_tool_executor:
-            return self._server_tool_executor
-
-        toolsets = self.toolset_manager.list_server_toolsets(dal=dal)
-
-        self._server_tool_executor = ToolExecutor(toolsets)
-
-        logging.debug(
-            f"Starting AI session with tools: {[tn for tn in self._server_tool_executor.tools_by_name.keys()]}"
-        )
-
-        return self._server_tool_executor
-
-    def refresh_server_tool_executor(
-        self, dal: Optional["SupabaseDal"]
+    def refresh_tool_executor(
+        self,
+        dal: Optional["SupabaseDal"] = None,
+        toolset_tag_filter: Optional[List[ToolsetTag]] = None,
+        enable_all_toolsets_possible: bool = False,
     ) -> list[tuple[str, str, str]]:
-        if not self._server_tool_executor:
-            self.create_tool_executor(dal)
+        """Refresh the cached tool executor and return a list of changes.
+
+        Changes include status transitions, added toolsets, and removed toolsets.
+        The cached executor is always replaced with the freshly-loaded one so that
+        added/removed toolsets are picked up even when no status changes occur.
+        """
+        logging.info("Refreshing toolsets with tags %s and enable_all_toolsets_possible=%s", toolset_tag_filter, enable_all_toolsets_possible)
+        # Normalize early so the same tags are used for both loading and caching.
+        tags = toolset_tag_filter or [ToolsetTag.CORE]
+
+        cache_key = self._executor_cache_key(tags, enable_all_toolsets_possible)
+        with self._executor_lock:
+            cached_executor = self._cached_tool_executor
+            cached_key = self._cached_executor_key
+        if not cached_executor or cached_key != cache_key:
+            # Cold start or key mismatch — run live prerequisite checks.
+            # Use DISABLED to avoid writing to disk (server runs on read-only fs).
+            self.create_tool_executor(
+                dal,
+                toolset_tag_filter=tags,
+                enable_all_toolsets_possible=enable_all_toolsets_possible,
+                prerequisite_cache=PrerequisiteCacheMode.DISABLED,
+                reuse_executor=True,
+            )
             return []
 
-        current_toolsets = self._server_tool_executor.toolsets
+        current_toolsets = cached_executor.toolsets
+
         new_toolsets, changes = (
-            self.toolset_manager.refresh_server_toolsets_and_get_changes(
-                current_toolsets, dal
+            self.toolset_manager.refresh_toolsets_and_get_changes(
+                current_toolsets,
+                dal,
+                toolset_tag_filter=tags,
+                enable_all_toolsets_possible=enable_all_toolsets_possible,
             )
         )
 
         if changes:
-            self._server_tool_executor = ToolExecutor(new_toolsets)
+            with self._executor_lock:
+                self._cached_tool_executor = ToolExecutor(new_toolsets)
+                self._cached_executor_key = cache_key
 
         return [(name, old.value, new.value) for name, old, new in changes]
-
-    def create_console_toolcalling_llm(
-        self,
-        dal: Optional["SupabaseDal"] = None,
-        refresh_toolsets: bool = False,
-        tracer=None,
-        model_name: Optional[str] = None,
-        tool_results_dir: Optional[Path] = None,
-    ) -> "ToolCallingLLM":
-        tool_executor = self.create_console_tool_executor(dal, refresh_toolsets)
-        from holmes.core.tool_calling_llm import ToolCallingLLM
-
-        return ToolCallingLLM(
-            tool_executor,
-            self.max_steps,
-            self._get_llm(tracer=tracer, model_key=model_name),
-            tool_results_dir=tool_results_dir,
-        )
-
-    def create_agui_toolcalling_llm(
-        self,
-        dal: Optional["SupabaseDal"] = None,
-        model: Optional[str] = None,
-        tracer=None,
-        tool_results_dir: Optional[Path] = None,
-    ) -> "ToolCallingLLM":
-        tool_executor = self.create_agui_tool_executor(dal)
-        from holmes.core.tool_calling_llm import ToolCallingLLM
-
-        return ToolCallingLLM(
-            tool_executor,
-            self.max_steps,
-            self._get_llm(model, tracer),
-            tool_results_dir=tool_results_dir,
-        )
 
     def create_toolcalling_llm(
         self,
         dal: Optional["SupabaseDal"] = None,
+        toolset_tag_filter: Optional[List[ToolsetTag]] = None,
+        enable_all_toolsets_possible: bool = True,
+        prerequisite_cache: PrerequisiteCacheMode = PrerequisiteCacheMode.ENABLED,
+        reuse_executor: bool = False,
         model: Optional[str] = None,
         tracer=None,
         tool_results_dir: Optional[Path] = None,
+        on_event: EventCallback = None,
     ) -> "ToolCallingLLM":
-        tool_executor = self.create_tool_executor(dal)
+        """
+        Create a ToolCallingLLM with explicit behavioral controls.
+
+        Executor parameters (toolset_tag_filter, enable_all_toolsets_possible,
+        prerequisite_cache, reuse_executor) are forwarded to
+        :meth:`create_tool_executor`.
+
+        Migration from removed helpers
+        ------------------------------
+        ``create_console_toolcalling_llm(dal, refresh_toolsets, tracer, model_name, tool_results_dir, on_event)``::
+
+            create_toolcalling_llm(
+                dal=dal,
+                toolset_tag_filter=[ToolsetTag.CORE, ToolsetTag.CLI],
+                enable_all_toolsets_possible=True,
+                prerequisite_cache=PrerequisiteCacheMode.FORCE_REFRESH if refresh_toolsets else PrerequisiteCacheMode.ENABLED,
+                model=model_name,
+                tracer=tracer,
+                tool_results_dir=tool_results_dir,
+                on_event=on_event,
+            )
+
+        ``create_agui_toolcalling_llm(dal, model, tracer, tool_results_dir)``::
+
+            create_toolcalling_llm(
+                dal=dal,
+                toolset_tag_filter=[ToolsetTag.CORE, ToolsetTag.CLI],
+                enable_all_toolsets_possible=True,
+                prerequisite_cache=PrerequisiteCacheMode.FORCE_REFRESH,
+                reuse_executor=True,
+                model=model,
+                tracer=tracer,
+                tool_results_dir=tool_results_dir,
+            )
+        """
         from holmes.core.tool_calling_llm import ToolCallingLLM
 
+        # Create LLM first so model info appears during toolset loading
+        llm = self._get_llm(model_key=model, tracer=tracer, on_event=on_event)
+        tool_executor = self.create_tool_executor(
+            dal=dal,
+            toolset_tag_filter=toolset_tag_filter,
+            enable_all_toolsets_possible=enable_all_toolsets_possible,
+            prerequisite_cache=prerequisite_cache,
+            reuse_executor=reuse_executor,
+            on_event=on_event,
+        )
         return ToolCallingLLM(
             tool_executor,
             self.max_steps,
-            self._get_llm(model, tracer),
+            llm,
             tool_results_dir=tool_results_dir,
         )
 
@@ -472,8 +607,24 @@ class Config(RobustaBaseConfig):
             raise ValueError("--slack-channel must be specified")
         return SlackDestination(self.slack_token.get_secret_value(), self.slack_channel)
 
+    @staticmethod
+    def _format_token_count(n: int) -> str:
+        """Format a token count for display: 1048576 → '1M', 32768 → '32K'."""
+        if n >= 1_000_000:
+            value = n / 1_000_000
+            return f"{int(value)}M" if value == int(value) else f"{value:.1f}M"
+        if n >= 1_000:
+            value = n / 1_000
+            return f"{int(value)}K" if value == int(value) else f"{value:.0f}K"
+        return str(n)
+
     # TODO: move this to the llm model registry
-    def _get_llm(self, model_key: Optional[str] = None, tracer=None) -> "DefaultLLM":
+    def _get_llm(
+        self,
+        model_key: Optional[str] = None,
+        tracer=None,
+        on_event: EventCallback = None,
+    ) -> "DefaultLLM":
         sentry_sdk.set_tag("requested_model", model_key)
         model_entry = self.llm_model_registry.get_model_params(model_key)
         model_params = model_entry.model_dump(exclude_none=True)
@@ -509,9 +660,16 @@ class Config(RobustaBaseConfig):
             name=model_name,
             is_robusta_model=is_robusta_model,
         )  # type: ignore
-        logging.info(
-            f"Using model: {model_name} ({llm.get_context_window_size():,} total tokens, {llm.get_maximum_output_token():,} output tokens)"
-        )
+        context_size = self._format_token_count(llm.get_context_window_size())
+        max_response = self._format_token_count(llm.get_maximum_output_token())
+        if self._model_source and self._model_source != "default":
+            source_hint = f"configured {self._model_source}"
+        else:
+            source_hint = "default, change with --model, for all options see https://holmesgpt.dev/ai-providers"
+        msg = f"Model: {model_name}, {context_size} context, {max_response} max response ({source_hint})"
+        display_logger.info(msg)
+        if on_event is not None:
+            on_event(StatusEvent(kind=StatusEventKind.MODEL_LOADED, name=model_name, message=msg))
         return llm
 
     def get_models_list(self) -> List[str]:
@@ -538,7 +696,12 @@ class SourceFactory(BaseModel):
         ticket_username: Optional[str],
         ticket_api_key: Optional[str],
         ticket_id: Optional[str],
+        model: Optional[str] = None,
     ) -> TicketSource:
+        from holmes.plugins.sources.jira import JiraServiceManagementSource
+        from holmes.plugins.sources.pagerduty import PagerDutySource
+
+        TicketSource.model_rebuild()
         supported_sources = [s.value for s in SupportedTicketSources]
         if source not in supported_sources:
             raise ValueError(
@@ -549,7 +712,7 @@ class SourceFactory(BaseModel):
             config = Config.load_from_file(
                 config_file=config_file,
                 api_key=None,
-                model=None,
+                model=model,
                 max_steps=None,
                 jira_url=ticket_url,
                 jira_username=ticket_username,
@@ -582,7 +745,7 @@ class SourceFactory(BaseModel):
             config = Config.load_from_file(
                 config_file=config_file,
                 api_key=None,
-                model=None,
+                model=model,
                 max_steps=None,
                 pagerduty_api_key=ticket_api_key,
                 pagerduty_user_email=ticket_username,

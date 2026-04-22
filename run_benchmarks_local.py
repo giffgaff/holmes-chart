@@ -345,7 +345,7 @@ Examples:
 
 Environment variables:
   OPENAI_API_KEY, ANTHROPIC_API_KEY    - LLM API keys
-  AZURE_API_BASE, AZURE_API_KEY        - Azure OpenAI configuration
+  AZURE_API_BASE, AZURE_API_KEY        - Azure AI Foundry configuration
   CLASSIFIER_MODEL                     - Model for scoring (default: gpt-4.1)
   EXPERIMENT_ID                        - Custom experiment name
   BRAINTRUST_API_KEY                   - Required for benchmark tracking (unless --no-braintrust)
@@ -450,11 +450,11 @@ def main():
         benchmark_type=benchmark_type,
     )
 
-    # Ignore the exit code from tests to match bash script behavior
-    runner.run()
+    exit_code = runner.run()
 
-    # Exit with 0 even if tests failed (matching bash script behavior)
-    sys.exit(0)
+    # Exit 0 or 1 = normal run (all pass, or some tests failed - both are valid benchmark results)
+    # Exit 2+ = crash (interrupted, INTERNALERROR, usage error, no tests collected)
+    sys.exit(0 if exit_code in (0, 1) else exit_code)
 
 
 if __name__ == "__main__":

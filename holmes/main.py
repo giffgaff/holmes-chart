@@ -36,10 +36,10 @@ from holmes.core.prompt import (
 )
 from holmes.core.resource_instruction import ResourceInstructionDocument
 from holmes.core.tool_calling_llm import LLMResult, ToolCallingLLM
-from holmes.core.tools import pretty_print_toolset_status
+from holmes.core.tools import PrerequisiteCacheMode, ToolsetTag, pretty_print_toolset_status
 from holmes.core.tools_utils.filesystem_result_storage import tool_result_storage
 from holmes.core.tracing import SpanType, TracingFactory
-from holmes.interactive import run_interactive_loop
+from holmes.interactive import InitProgressRenderer, run_interactive_loop, silence_display_loggers
 from holmes.plugins.destinations import DestinationType
 from holmes.plugins.interfaces import Issue
 from holmes.plugins.prompts import load_and_render_prompt
@@ -98,7 +98,7 @@ opt_custom_toolsets: Optional[List[Path]] = typer.Option(
     help="Path to a custom toolsets. The status of the custom toolsets specified here won't be cached (can specify -t multiple times to add multiple toolsets)",
 )
 opt_max_steps: Optional[int] = typer.Option(
-    40,
+    100,
     "--max-steps",
     help="Advanced. Maximum number of steps the LLM can take to investigate the issue",
 )
@@ -172,7 +172,11 @@ def _investigate_issue(
         f"\n #This is context from the issue:\n{issue.raw}",
         context={},
     )
-    return ai.prompt_call(system_prompt, user_prompt)
+    messages = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": user_prompt},
+    ]
+    return ai.call(messages)
 
 
 # TODO: add streaming output
@@ -227,7 +231,7 @@ def ask(
     trace: Optional[str] = typer.Option(
         None,
         "--trace",
-        help="Enable tracing to the specified provider (e.g., 'braintrust')",
+        help="Enable tracing to the specified provider ('braintrust' or 'otel'). OTel auto-enables if OTEL_EXPORTER_OTLP_ENDPOINT is set.",
     ),
     system_prompt_additions: Optional[str] = typer.Option(
         None,
@@ -273,6 +277,11 @@ def ask(
                 "[bold yellow]Interactive mode disabled when reading piped input[/bold yellow]"
             )
             interactive = False
+
+    # Silence display loggers early for interactive mode so that
+    # init messages are rendered via the InitProgressRenderer instead.
+    if interactive:
+        silence_display_loggers()
 
     config = Config.load_from_file(
         config_file,
@@ -327,13 +336,27 @@ def ask(
         }
 
     with tool_result_storage() as tool_results_dir:
-        ai = config.create_console_toolcalling_llm(
-            dal=None,  # type: ignore
-            refresh_toolsets=refresh_toolsets,  # flag to refresh the toolset status
+        init_renderer = None
+        on_event = None
+        if interactive:
+            init_renderer = InitProgressRenderer(
+                console, model_name=model or config.model or ""
+            )
+            on_event = init_renderer.on_event
+            init_renderer.start()
+
+        ai = config.create_toolcalling_llm(
+            toolset_tag_filter=[ToolsetTag.CORE, ToolsetTag.CLI],
+            enable_all_toolsets_possible=True,
+            prerequisite_cache=PrerequisiteCacheMode.FORCE_REFRESH if refresh_toolsets else PrerequisiteCacheMode.ENABLED,
             tracer=tracer,
-            model_name=model,
+            model=model,
             tool_results_dir=tool_results_dir,
+            on_event=on_event,
         )
+
+        if init_renderer is not None:
+            init_renderer.stop()
 
         if interactive:
             run_interactive_loop(
@@ -465,7 +488,12 @@ def alertmanager(
     )
 
     with tool_result_storage() as tool_results_dir:
-        ai = config.create_console_toolcalling_llm(model_name=model, tool_results_dir=tool_results_dir)
+        ai = config.create_toolcalling_llm(
+            toolset_tag_filter=[ToolsetTag.CORE, ToolsetTag.CLI],
+            enable_all_toolsets_possible=True,
+            model=model,
+            tool_results_dir=tool_results_dir,
+        )
 
         source = config.create_alertmanager_source()
 
@@ -596,7 +624,12 @@ def jira(
 
     results = []
     with tool_result_storage() as tool_results_dir:
-        ai = config.create_console_toolcalling_llm(model_name=model, tool_results_dir=tool_results_dir)
+        ai = config.create_toolcalling_llm(
+            toolset_tag_filter=[ToolsetTag.CORE, ToolsetTag.CLI],
+            enable_all_toolsets_possible=True,
+            model=model,
+            tool_results_dir=tool_results_dir,
+        )
         for i, issue in enumerate(issues):
             console.print(
                 f"[bold yellow]Analyzing Jira ticket {i+1}/{len(issues)}: {issue.name}...[/bold yellow]"
@@ -668,6 +701,7 @@ def ticket(
             ticket_username=ticket_username,
             ticket_api_key=ticket_api_key,
             ticket_id=ticket_id,
+            model=model,
         )
     except Exception as e:
         console.print(f"[bold red]Error: {str(e)}[/bold red]")
@@ -685,7 +719,12 @@ def ticket(
         return
 
     with tool_result_storage() as tool_results_dir:
-        ai = ticket_source.config.create_console_toolcalling_llm(model_name=model, tool_results_dir=tool_results_dir)
+        ai = ticket_source.config.create_toolcalling_llm(
+            toolset_tag_filter=[ToolsetTag.CORE, ToolsetTag.CLI],
+            enable_all_toolsets_possible=True,
+            model=model,
+            tool_results_dir=tool_results_dir,
+        )
 
         # Render ticket-specific additions
         ticket_additions = load_and_render_prompt(
@@ -713,7 +752,11 @@ def ticket(
         )
 
         ticket_user_prompt = generate_user_prompt(prompt, context={})
-        result = ai.prompt_call(system_prompt, ticket_user_prompt)
+        messages = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": ticket_user_prompt},
+        ]
+        result = ai.call(messages)
 
         console.print(Rule())
         console.print(
@@ -790,7 +833,12 @@ def github(
         f"[bold yellow]Analyzing {len(issues)} GitHub Issues.[/bold yellow] [red]Press Ctrl+C to stop.[/red]"
     )
     with tool_result_storage() as tool_results_dir:
-        ai = config.create_console_toolcalling_llm(model_name=model, tool_results_dir=tool_results_dir)
+        ai = config.create_toolcalling_llm(
+            toolset_tag_filter=[ToolsetTag.CORE, ToolsetTag.CLI],
+            enable_all_toolsets_possible=True,
+            model=model,
+            tool_results_dir=tool_results_dir,
+        )
         for i, issue in enumerate(issues):
             console.print(
                 f"[bold yellow]Analyzing GitHub issue {i+1}/{len(issues)}: {issue.name}...[/bold yellow]"
@@ -866,7 +914,12 @@ def pagerduty(
 
     results = []
     with tool_result_storage() as tool_results_dir:
-        ai = config.create_console_toolcalling_llm(model_name=model, tool_results_dir=tool_results_dir)
+        ai = config.create_toolcalling_llm(
+            toolset_tag_filter=[ToolsetTag.CORE, ToolsetTag.CLI],
+            enable_all_toolsets_possible=True,
+            model=model,
+            tool_results_dir=tool_results_dir,
+        )
         for i, issue in enumerate(issues):
             console.print(
                 f"[bold yellow]Analyzing PagerDuty incident {i+1}/{len(issues)}: {issue.name}...[/bold yellow]"
@@ -940,7 +993,12 @@ def opsgenie(
         f"[bold yellow]Analyzing {len(issues)} OpsGenie alerts.[/bold yellow] [red]Press Ctrl+C to stop.[/red]"
     )
     with tool_result_storage() as tool_results_dir:
-        ai = config.create_console_toolcalling_llm(model_name=model, tool_results_dir=tool_results_dir)
+        ai = config.create_toolcalling_llm(
+            toolset_tag_filter=[ToolsetTag.CORE, ToolsetTag.CLI],
+            enable_all_toolsets_possible=True,
+            model=model,
+            tool_results_dir=tool_results_dir,
+        )
         for i, issue in enumerate(issues):
             console.print(
                 f"[bold yellow]Analyzing OpsGenie alert {i+1}/{len(issues)}: {issue.name}...[/bold yellow]"
@@ -1008,6 +1066,9 @@ def version() -> None:
 
 
 def run():
+    # Default to "ask" command when no subcommand is given
+    if len(sys.argv) == 1:
+        sys.argv.insert(1, "ask")
     app()
 
 
